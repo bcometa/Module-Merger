@@ -343,6 +343,12 @@ for k, v in [
     ("status", None), ("stats", None),
     ("auto_match_msg", None),
     ("page", 0),
+    # Upload-change tracking — prevent re-reading the same upload on every rerun.
+    # Without these the download-button rerun retriggers the upload handler,
+    # which wipes `status` and bounces the UI back to the upload screen.
+    ("last_pair_sig", None),
+    ("last_a_sig", None),
+    ("last_b_sig", None),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -375,15 +381,43 @@ with st.container(border=True):
     )
 
     if pair_files:
-        try:
-            # Case 1: single ZIP
-            if len(pair_files) == 1 and is_zip_filename(pair_files[0].name):
-                zip_bytes = pair_files[0].read()
-                extracted = extract_pair_from_zip(zip_bytes)
-                if len(extracted) != 2:
-                    st.error(f"ZIP must contain exactly 2 files. Found {len(extracted)}.")
-                else:
-                    (n1, d1), (n2, d2) = extracted
+        # Build a stable signature of the current upload so we only process it
+        # ONCE per real change — every other rerun (e.g. download-button clicks)
+        # will short-circuit and leave session state alone.
+        pair_sig = tuple((f.name, f.size) for f in pair_files)
+        if pair_sig != st.session_state.last_pair_sig:
+            try:
+                # Case 1: single ZIP
+                if len(pair_files) == 1 and is_zip_filename(pair_files[0].name):
+                    zip_bytes = pair_files[0].getvalue()
+                    extracted = extract_pair_from_zip(zip_bytes)
+                    if len(extracted) != 2:
+                        st.error(f"ZIP must contain exactly 2 files. Found {len(extracted)}.")
+                    else:
+                        (n1, d1), (n2, d2) = extracted
+                        a_idx, reason = detect_ab(n1, n2)
+                        if a_idx == 0:
+                            st.session_state.data_a, st.session_state.name_a = d1, n1
+                            st.session_state.data_b, st.session_state.name_b = d2, n2
+                        else:
+                            st.session_state.data_a, st.session_state.name_a = d2, n2
+                            st.session_state.data_b, st.session_state.name_b = d1, n1
+                        st.session_state.auto_match_msg = (
+                            f'✓ From ZIP "{pair_files[0].name}": '
+                            f'**{st.session_state.name_a}** → File A, '
+                            f'**{st.session_state.name_b}** → File B ({reason})'
+                        )
+                        # Invalidate any prior results
+                        st.session_state.status = None
+                        st.session_state.stats = None
+                    st.session_state.last_pair_sig = pair_sig
+
+                # Case 2: exactly two files dropped
+                elif len(pair_files) == 2:
+                    n1 = pair_files[0].name
+                    d1 = pair_files[0].getvalue()
+                    n2 = pair_files[1].name
+                    d2 = pair_files[1].getvalue()
                     a_idx, reason = detect_ab(n1, n2)
                     if a_idx == 0:
                         st.session_state.data_a, st.session_state.name_a = d1, n1
@@ -392,40 +426,23 @@ with st.container(border=True):
                         st.session_state.data_a, st.session_state.name_a = d2, n2
                         st.session_state.data_b, st.session_state.name_b = d1, n1
                     st.session_state.auto_match_msg = (
-                        f'✓ From ZIP "{pair_files[0].name}": '
+                        f'✓ From multi-file selection: '
                         f'**{st.session_state.name_a}** → File A, '
                         f'**{st.session_state.name_b}** → File B ({reason})'
                     )
-                    # Invalidate any prior results
                     st.session_state.status = None
                     st.session_state.stats = None
+                    st.session_state.last_pair_sig = pair_sig
 
-            # Case 2: exactly two files dropped
-            elif len(pair_files) == 2:
-                n1, d1 = pair_files[0].name, pair_files[0].read()
-                n2, d2 = pair_files[1].name, pair_files[1].read()
-                a_idx, reason = detect_ab(n1, n2)
-                if a_idx == 0:
-                    st.session_state.data_a, st.session_state.name_a = d1, n1
-                    st.session_state.data_b, st.session_state.name_b = d2, n2
                 else:
-                    st.session_state.data_a, st.session_state.name_a = d2, n2
-                    st.session_state.data_b, st.session_state.name_b = d1, n1
-                st.session_state.auto_match_msg = (
-                    f'✓ From multi-file selection: '
-                    f'**{st.session_state.name_a}** → File A, '
-                    f'**{st.session_state.name_b}** → File B ({reason})'
-                )
-                st.session_state.status = None
-                st.session_state.stats = None
-
-            else:
-                st.error(
-                    f"Expected exactly 2 files (or a ZIP containing 2 files). "
-                    f"Got {len(pair_files)}."
-                )
-        except Exception as e:
-            st.error(f"Failed to process upload: {e}")
+                    st.error(
+                        f"Expected exactly 2 files (or a ZIP containing 2 files). "
+                        f"Got {len(pair_files)}."
+                    )
+                    st.session_state.last_pair_sig = pair_sig
+            except Exception as e:
+                st.error(f"Failed to process upload: {e}")
+                st.session_state.last_pair_sig = pair_sig
 
 st.markdown("###### or upload separately")
 
@@ -433,17 +450,23 @@ col1, col2 = st.columns(2)
 with col1:
     file_a_upload = st.file_uploader("File A", type=None, key="file_a_uploader")
     if file_a_upload is not None:
-        st.session_state.data_a = file_a_upload.read()
-        st.session_state.name_a = file_a_upload.name
-        st.session_state.status = None
-        st.session_state.stats = None
+        a_sig = (file_a_upload.name, file_a_upload.size)
+        if a_sig != st.session_state.last_a_sig:
+            st.session_state.data_a = file_a_upload.getvalue()
+            st.session_state.name_a = file_a_upload.name
+            st.session_state.last_a_sig = a_sig
+            st.session_state.status = None
+            st.session_state.stats = None
 with col2:
     file_b_upload = st.file_uploader("File B", type=None, key="file_b_uploader")
     if file_b_upload is not None:
-        st.session_state.data_b = file_b_upload.read()
-        st.session_state.name_b = file_b_upload.name
-        st.session_state.status = None
-        st.session_state.stats = None
+        b_sig = (file_b_upload.name, file_b_upload.size)
+        if b_sig != st.session_state.last_b_sig:
+            st.session_state.data_b = file_b_upload.getvalue()
+            st.session_state.name_b = file_b_upload.name
+            st.session_state.last_b_sig = b_sig
+            st.session_state.status = None
+            st.session_state.stats = None
 
 # ----- Status of current loaded files -----
 
@@ -486,9 +509,14 @@ with action_cols[1]:
 with action_cols[2]:
     if st.button("Reset"):
         for k in ["data_a", "data_b", "name_a", "name_b", "status", "stats",
-                  "auto_match_msg", "page"]:
+                  "auto_match_msg", "page",
+                  "last_pair_sig", "last_a_sig", "last_b_sig"]:
             if k in st.session_state:
                 st.session_state[k] = None if k != "page" else 0
+        # Also clear the file_uploader widgets themselves so the visual state matches
+        for widget_key in ["pair_uploader", "file_a_uploader", "file_b_uploader"]:
+            if widget_key in st.session_state:
+                del st.session_state[widget_key]
         st.rerun()
 
 # ----- Run processing -----
