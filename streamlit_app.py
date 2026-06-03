@@ -653,9 +653,25 @@ for k, v in [
     ("last_a_sig", None),
     ("last_b_sig", None),
     ("processed", False),
+    # Cached merged outputs — built ONCE at end of processing, then reused on every
+    # rerun. Without this, the download_button's data= argument would rebuild the
+    # full output bytes (or the entire batch ZIP) on every UI interaction, which
+    # OOM-kills the Streamlit Cloud worker on large files.
+    ("cached_out_a", None),
+    ("cached_out_b", None),         # None == identical to cached_out_a (no conflicts)
+    ("cached_zip_a", None),
+    ("cached_zip_b", None),         # None == identical to cached_zip_a
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
+
+
+def _clear_cached_outputs() -> None:
+    """Wipe cached merged outputs. Call whenever the underlying data changes."""
+    st.session_state.cached_out_a = None
+    st.session_state.cached_out_b = None
+    st.session_state.cached_zip_a = None
+    st.session_state.cached_zip_b = None
 
 
 # ============================================================================
@@ -744,6 +760,7 @@ with st.container(border=True):
             st.session_state.page = 0
             st.session_state.processed = False
             st.session_state.last_upload_sig = sig
+            _clear_cached_outputs()
 
 # ----- Optional single-pair manual uploaders -----
 with st.expander("Or upload File A and File B separately (single-pair only)"):
@@ -828,6 +845,7 @@ with action_cols[0]:
             p["status"] = None
             p["stats"] = None
         st.session_state.processed = False
+        _clear_cached_outputs()
         st.rerun()
 
 with action_cols[1]:
@@ -842,6 +860,7 @@ with action_cols[2]:
                   "processed"]:
             if k in st.session_state:
                 st.session_state[k] = None if k not in ("current_pair_idx", "page", "processed") else (0 if k != "processed" else False)
+        _clear_cached_outputs()
         for widget_key in ["multi_uploader", "file_a_uploader", "file_b_uploader"]:
             if widget_key in st.session_state:
                 del st.session_state[widget_key]
@@ -863,6 +882,36 @@ if process_clicked and st.session_state.pairs:
             p["error"] = str(e)
         progress.progress((i + 1) / n, text=f"Processing pair {i + 1} of {n}: {p['out_name']}")
     progress.empty()
+
+    # Build the merged outputs ONCE and cache them. The download buttons read
+    # straight from session_state, so subsequent reruns (filter toggles,
+    # pagination, hex-viewer interactions) don't re-allocate or recompress
+    # anything. This is what makes downloads reliable on large files.
+    successful_pairs = [p for p in st.session_state.pairs if p["status"] is not None]
+    if successful_pairs:
+        if len(st.session_state.pairs) == 1 and len(successful_pairs) == 1:
+            # Single-pair mode → cache the two binaries
+            sp = successful_pairs[0]
+            build_msg = st.empty()
+            build_msg.info("Building merged binaries…")
+            st.session_state.cached_out_a = build_output(sp["data_a"], sp["data_b"], sp["status"], prefer_b=False)
+            if sp["stats"]["conflicts"] > 0:
+                st.session_state.cached_out_b = build_output(sp["data_a"], sp["data_b"], sp["status"], prefer_b=True)
+            else:
+                st.session_state.cached_out_b = None  # signals "identical to A"
+            build_msg.empty()
+        else:
+            # Batch mode → cache the ZIP(s)
+            build_msg = st.empty()
+            build_msg.info(f"Building merged ZIP for {len(successful_pairs)} pair(s)…")
+            st.session_state.cached_zip_a = build_zip(successful_pairs, prefer_b=False)
+            has_conflicts = any(p["stats"]["conflicts"] > 0 for p in successful_pairs)
+            if has_conflicts:
+                st.session_state.cached_zip_b = build_zip(successful_pairs, prefer_b=True)
+            else:
+                st.session_state.cached_zip_b = None  # signals "identical to A"
+            build_msg.empty()
+
     st.session_state.processed = True
     st.session_state.current_pair_idx = 0
     st.session_state.page = 0
@@ -927,30 +976,35 @@ if st.session_state.processed and st.session_state.pairs:
 
         # ----- ZIP Downloads -----
         st.markdown("##### Downloads")
-        if successful:
-            has_conflicts = any(p["stats"]["conflicts"] > 0 for p in successful)
+        if successful and st.session_state.cached_zip_a is not None:
             dl_cols = st.columns(2)
             with dl_cols[0]:
-                zip_a = build_zip(successful, prefer_b=False)
+                # Reads from session_state — built once at end of processing
                 st.download_button(
-                    f"⬇ merged_preferA.zip ({format_bytes(len(zip_a))})",
-                    data=zip_a,
+                    f"⬇ merged_preferA.zip ({format_bytes(len(st.session_state.cached_zip_a))})",
+                    data=st.session_state.cached_zip_a,
                     file_name="merged_preferA.zip",
                     mime="application/zip",
                     use_container_width=True,
                 )
             with dl_cols[1]:
-                if has_conflicts:
-                    zip_b = build_zip(successful, prefer_b=True)
+                if st.session_state.cached_zip_b is not None:
                     st.download_button(
-                        f"⬇ merged_preferB.zip ({format_bytes(len(zip_b))})",
-                        data=zip_b,
+                        f"⬇ merged_preferB.zip ({format_bytes(len(st.session_state.cached_zip_b))})",
+                        data=st.session_state.cached_zip_b,
                         file_name="merged_preferB.zip",
                         mime="application/zip",
                         use_container_width=True,
                     )
                 else:
-                    st.button("merged_preferB.zip (identical — no conflicts)", disabled=True, use_container_width=True)
+                    # No conflicts → would be identical to A
+                    st.download_button(
+                        "⬇ merged_preferB.zip (identical to A — no conflicts)",
+                        data=st.session_state.cached_zip_a,
+                        file_name="merged_preferB.zip",
+                        mime="application/zip",
+                        use_container_width=True,
+                    )
             st.caption(
                 "ZIPs contain all merged outputs flat, named after the matched source filename. "
                 "preferA and preferB only differ on conflict sectors (both copies good but bytes differ)."
@@ -998,21 +1052,32 @@ if st.session_state.processed and st.session_state.pairs:
         st.subheader("Downloads")
         dl_cols = st.columns(2)
         with dl_cols[0]:
-            out_a = build_output(p["data_a"], p["data_b"], p["status"], prefer_b=False)
+            # Reads from session_state — built once at end of processing, not per-rerun
             st.download_button(
-                "⬇ merged_preferA.bin",
-                data=out_a,
+                f"⬇ merged_preferA.bin ({format_bytes(len(st.session_state.cached_out_a))})",
+                data=st.session_state.cached_out_a,
                 file_name="merged_preferA.bin",
                 mime="application/octet-stream",
+                use_container_width=True,
             )
         with dl_cols[1]:
-            out_b = build_output(p["data_a"], p["data_b"], p["status"], prefer_b=True)
-            st.download_button(
-                "⬇ merged_preferB.bin",
-                data=out_b,
-                file_name="merged_preferB.bin",
-                mime="application/octet-stream",
-            )
+            if st.session_state.cached_out_b is not None:
+                st.download_button(
+                    f"⬇ merged_preferB.bin ({format_bytes(len(st.session_state.cached_out_b))})",
+                    data=st.session_state.cached_out_b,
+                    file_name="merged_preferB.bin",
+                    mime="application/octet-stream",
+                    use_container_width=True,
+                )
+            else:
+                # No conflicts → A and B would be identical; just hand out a copy of A
+                st.download_button(
+                    "⬇ merged_preferB.bin (identical to A — no conflicts)",
+                    data=st.session_state.cached_out_a,
+                    file_name="merged_preferB.bin",
+                    mime="application/octet-stream",
+                    use_container_width=True,
+                )
         st.caption(
             "Files are identical when there are no conflicts. On conflicts: "
             "Version A uses File A's bytes; Version B uses File B's bytes."
