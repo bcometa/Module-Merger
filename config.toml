@@ -1,0 +1,5 @@
+[server]
+# Bump the WebSocket message cap so large download data URIs aren't truncated
+# when shipped to the browser as HTML. Default is 200 MB.
+maxMessageSize = 500
+maxUploadSize = 500
