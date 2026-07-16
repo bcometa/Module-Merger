@@ -185,6 +185,45 @@ def render_download_link(url_path: str, filename: str, label: str) -> None:
     st.markdown(html, unsafe_allow_html=True)
 
 
+# Streamlit's static file handler rejects files over 200 MB ("404: File is
+# too large"). We zip outputs (which brings them well under that for module
+# data), and stay a little below the ceiling to be safe.
+STATIC_MAX_BYTES = 195 * 1024 * 1024
+
+
+def deliver_zip(url_path: str, disk_path: str, size: int, filename: str, label: str) -> None:
+    """
+    Serve a merged ZIP the most reliable way available.
+
+    Preferred: a static-file link (app/static/...), which streams from disk
+    and never puts the payload in the app's memory. Used when static serving
+    is enabled AND the file is under Streamlit's 200 MB static limit.
+
+    Fallback: st.download_button, which works even if static serving isn't
+    enabled on the deployment. We only read the (compressed, small) ZIP into
+    memory here, so this stays light.
+    """
+    static_on = bool(st.get_option("server.enableStaticServing"))
+    if static_on and size <= STATIC_MAX_BYTES:
+        render_download_link(url_path, filename, label)
+        return
+    # Fallback — read the compressed ZIP into memory and hand to download_button
+    try:
+        with open(disk_path, "rb") as fh:
+            data = fh.read()
+        st.download_button(
+            label, data=data, file_name=filename,
+            mime="application/zip", use_container_width=True,
+        )
+        if size > STATIC_MAX_BYTES:
+            st.caption(
+                f"⚠️ This ZIP is {format_bytes(size)} — over Streamlit's 195 MB static "
+                "limit, so it's served via the in-app downloader instead (may be slower)."
+            )
+    except OSError:
+        st.error("Download file not found — please re-process the pair.")
+
+
 # ============================================================================
 # Smart A/B detection for the explicit "two-file" case
 # ============================================================================
@@ -493,22 +532,32 @@ def _build_output_array(data_a: bytes, data_b: bytes, status_bytes: bytes,
     return out
 
 
-def write_merged_binary(data_a: bytes, data_b: bytes, status_bytes: bytes,
-                        prefer_b: bool, out_path: str) -> int:
-    """Write a single merged binary straight to disk. Returns byte size."""
-    out = _build_output_array(data_a, data_b, status_bytes, prefer_b)
-    out.tofile(out_path)          # streams to disk, no extra in-memory copy
-    size = out.size
-    del out
-    return size
+def _stream_array_into_zip(z: zipfile.ZipFile, arcname: str, out: np.ndarray) -> None:
+    """
+    Write a numpy output array into an open ZIP as `arcname`, streaming in
+    8 MB chunks. Avoids a full out.tobytes() copy (which would double the
+    output's memory footprint) — critical for 200 MB+ modules.
+    """
+    flat = out.reshape(-1)          # 1D view, zero copy (out is C-contiguous)
+    mv = memoryview(flat)
+    chunk = 8 * 1024 * 1024
+    with z.open(arcname, "w") as f:
+        for i in range(0, flat.nbytes, chunk):
+            f.write(mv[i:i + chunk])
 
 
 def write_merged_zip(pairs: List[Dict], prefer_b: bool, out_path: str) -> int:
     """
     Write a flat ZIP of all merged outputs to disk. Returns ZIP byte size.
 
-    Each pair's output is materialized one at a time (peak = one output in
-    memory), added to the on-disk ZIP, then freed.
+    Works for a single pair (list of one) or a whole batch. Each pair's output
+    is built one at a time, streamed into the on-disk ZIP, then freed — peak
+    extra memory is one output array (never a second tobytes copy).
+
+    Zipping also brings the payload under Streamlit's 200 MB static-file limit:
+    firmware module dumps are highly compressible (large zero-filled and
+    repeated regions), so a 200 MB+ raw module typically shrinks to a fraction
+    of that.
     """
     used_names = set()
     with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
@@ -524,7 +573,7 @@ def write_merged_zip(pairs: List[Dict], prefer_b: bool, out_path: str) -> int:
                 final_name = f"{stem}_{k}.{ext}" if dot else f"{name}_{k}"
                 k += 1
             used_names.add(final_name)
-            z.writestr(final_name, out.tobytes())
+            _stream_array_into_zip(z, final_name, out)
             del out
     return os.path.getsize(out_path)
 
@@ -735,16 +784,16 @@ for k, v in [
     ("last_a_sig", None),
     ("last_b_sig", None),
     ("processed", False),
-    # Merged outputs are written to disk (static/merged/) and served by URL.
-    # Session state holds only the small URL paths + sizes, never the bytes —
-    # this is what keeps memory flat regardless of file size. A URL of None
-    # for the "B" variants means "identical to A" (no conflicts).
-    ("dl_url_a", None),
-    ("dl_url_b", None),
-    ("dl_size_a", 0),
-    ("dl_size_b", 0),
+    # Merged outputs are ZIP'd to disk (static/merged/) and served either by a
+    # static URL or, as a fallback, the in-app downloader reading from disk_path.
+    # Session state holds only the small URL/path/size — never the bytes — so
+    # memory stays flat regardless of file size. Both single-pair and batch use
+    # the same keys (single pair is just a one-item batch). A "B" URL of None
+    # means "identical to A" (no conflicts).
     ("dl_zip_url_a", None),
     ("dl_zip_url_b", None),
+    ("dl_zip_path_a", None),
+    ("dl_zip_path_b", None),
     ("dl_zip_size_a", 0),
     ("dl_zip_size_b", 0),
     ("generated_files", []),        # absolute paths to unlink on next process/reset
@@ -764,12 +813,10 @@ def _clear_cached_outputs() -> None:
         except OSError:
             pass
     st.session_state.generated_files = []
-    st.session_state.dl_url_a = None
-    st.session_state.dl_url_b = None
-    st.session_state.dl_size_a = 0
-    st.session_state.dl_size_b = 0
     st.session_state.dl_zip_url_a = None
     st.session_state.dl_zip_url_b = None
+    st.session_state.dl_zip_path_a = None
+    st.session_state.dl_zip_path_b = None
     st.session_state.dl_zip_size_a = 0
     st.session_state.dl_zip_size_b = 0
 
@@ -983,60 +1030,40 @@ if process_clicked and st.session_state.pairs:
         progress.progress((i + 1) / n, text=f"Processing pair {i + 1} of {n}: {p['out_name']}")
     progress.empty()
 
-    # Build the merged outputs ONCE and write them straight to disk under
-    # static/merged/. Session state keeps only the tiny URL + size. Downloads
-    # are then served by Streamlit's static file handler (Tornado streams from
-    # disk), so the merged bytes never sit in the app's heap as a payload —
-    # this is what keeps us under the 1 GB Streamlit Cloud memory limit and
-    # makes large-file downloads reliable.
+    # Build the merged outputs ONCE, ZIP them to disk under static/merged/, and
+    # keep only the tiny URL/path/size in session. Single-pair and batch use the
+    # same code (single pair = one-item batch). Zipping keeps the payload under
+    # Streamlit's 200 MB static-file limit AND is what the user wants to hand to
+    # PC-3000. deliver_zip() then serves via static URL or the in-app fallback.
     _clear_cached_outputs()   # delete any files from a previous run
     _sweep_old_downloads()    # and any stragglers older than 2h
     token = uuid.uuid4().hex[:8]
 
     successful_pairs = [p for p in st.session_state.pairs if p["status"] is not None]
     if successful_pairs:
-        if len(st.session_state.pairs) == 1 and len(successful_pairs) == 1:
-            # Single-pair mode → write the two binaries to disk
-            sp = successful_pairs[0]
-            build_msg = st.empty()
-            build_msg.info("Building merged binary…")
-            fn_a = f"{token}_merged_preferA.bin"
-            path_a = os.path.join(DOWNLOAD_DIR, fn_a)
-            st.session_state.dl_size_a = write_merged_binary(
-                sp["data_a"], sp["data_b"], sp["status"], False, path_a)
-            st.session_state.dl_url_a = f"{DOWNLOAD_URL_PREFIX}/{fn_a}"
-            st.session_state.generated_files.append(path_a)
-            if sp["stats"]["conflicts"] > 0:
-                fn_b = f"{token}_merged_preferB.bin"
-                path_b = os.path.join(DOWNLOAD_DIR, fn_b)
-                st.session_state.dl_size_b = write_merged_binary(
-                    sp["data_a"], sp["data_b"], sp["status"], True, path_b)
-                st.session_state.dl_url_b = f"{DOWNLOAD_URL_PREFIX}/{fn_b}"
-                st.session_state.generated_files.append(path_b)
-            else:
-                st.session_state.dl_url_b = None  # identical to A
-                st.session_state.dl_size_b = 0
-            build_msg.empty()
+        build_msg = st.empty()
+        build_msg.info(f"Building merged ZIP for {len(successful_pairs)} file(s)…")
+
+        fn_a = f"{token}_merged_preferA.zip"
+        path_a = os.path.join(DOWNLOAD_DIR, fn_a)
+        st.session_state.dl_zip_size_a = write_merged_zip(successful_pairs, False, path_a)
+        st.session_state.dl_zip_url_a = f"{DOWNLOAD_URL_PREFIX}/{fn_a}"
+        st.session_state.dl_zip_path_a = path_a
+        st.session_state.generated_files.append(path_a)
+
+        has_conflicts = any(p["stats"]["conflicts"] > 0 for p in successful_pairs)
+        if has_conflicts:
+            fn_b = f"{token}_merged_preferB.zip"
+            path_b = os.path.join(DOWNLOAD_DIR, fn_b)
+            st.session_state.dl_zip_size_b = write_merged_zip(successful_pairs, True, path_b)
+            st.session_state.dl_zip_url_b = f"{DOWNLOAD_URL_PREFIX}/{fn_b}"
+            st.session_state.dl_zip_path_b = path_b
+            st.session_state.generated_files.append(path_b)
         else:
-            # Batch mode → write the ZIP(s) to disk
-            build_msg = st.empty()
-            build_msg.info(f"Building merged ZIP for {len(successful_pairs)} pair(s)…")
-            fn_za = f"{token}_merged_preferA.zip"
-            path_za = os.path.join(DOWNLOAD_DIR, fn_za)
-            st.session_state.dl_zip_size_a = write_merged_zip(successful_pairs, False, path_za)
-            st.session_state.dl_zip_url_a = f"{DOWNLOAD_URL_PREFIX}/{fn_za}"
-            st.session_state.generated_files.append(path_za)
-            has_conflicts = any(p["stats"]["conflicts"] > 0 for p in successful_pairs)
-            if has_conflicts:
-                fn_zb = f"{token}_merged_preferB.zip"
-                path_zb = os.path.join(DOWNLOAD_DIR, fn_zb)
-                st.session_state.dl_zip_size_b = write_merged_zip(successful_pairs, True, path_zb)
-                st.session_state.dl_zip_url_b = f"{DOWNLOAD_URL_PREFIX}/{fn_zb}"
-                st.session_state.generated_files.append(path_zb)
-            else:
-                st.session_state.dl_zip_url_b = None  # identical to A
-                st.session_state.dl_zip_size_b = 0
-            build_msg.empty()
+            st.session_state.dl_zip_url_b = None  # identical to A
+            st.session_state.dl_zip_path_b = None
+            st.session_state.dl_zip_size_b = 0
+        build_msg.empty()
 
     st.session_state.processed = True
     st.session_state.current_pair_idx = 0
@@ -1105,22 +1132,28 @@ if st.session_state.processed and st.session_state.pairs:
         if successful and st.session_state.dl_zip_url_a is not None:
             dl_cols = st.columns(2)
             with dl_cols[0]:
-                render_download_link(
+                deliver_zip(
                     st.session_state.dl_zip_url_a,
+                    st.session_state.dl_zip_path_a,
+                    st.session_state.dl_zip_size_a,
                     "merged_preferA.zip",
                     f"⬇ merged_preferA.zip ({format_bytes(st.session_state.dl_zip_size_a)})",
                 )
             with dl_cols[1]:
                 if st.session_state.dl_zip_url_b is not None:
-                    render_download_link(
+                    deliver_zip(
                         st.session_state.dl_zip_url_b,
+                        st.session_state.dl_zip_path_b,
+                        st.session_state.dl_zip_size_b,
                         "merged_preferB.zip",
                         f"⬇ merged_preferB.zip ({format_bytes(st.session_state.dl_zip_size_b)})",
                     )
                 else:
                     # No conflicts → identical to A; serve the same file
-                    render_download_link(
+                    deliver_zip(
                         st.session_state.dl_zip_url_a,
+                        st.session_state.dl_zip_path_a,
+                        st.session_state.dl_zip_size_a,
                         "merged_preferB.zip",
                         "⬇ merged_preferB.zip (identical to A — no conflicts)",
                     )
@@ -1169,26 +1202,33 @@ if st.session_state.processed and st.session_state.pairs:
 
         st.divider()
         st.subheader("Downloads")
+        st.caption(f"Merged module is zipped (inside: `{p['out_name']}`).")
         dl_cols = st.columns(2)
         with dl_cols[0]:
-            render_download_link(
-                st.session_state.dl_url_a,
-                "merged_preferA.bin",
-                f"⬇ merged_preferA.bin ({format_bytes(st.session_state.dl_size_a)})",
+            deliver_zip(
+                st.session_state.dl_zip_url_a,
+                st.session_state.dl_zip_path_a,
+                st.session_state.dl_zip_size_a,
+                "merged_preferA.zip",
+                f"⬇ merged_preferA.zip ({format_bytes(st.session_state.dl_zip_size_a)})",
             )
         with dl_cols[1]:
-            if st.session_state.dl_url_b is not None:
-                render_download_link(
-                    st.session_state.dl_url_b,
-                    "merged_preferB.bin",
-                    f"⬇ merged_preferB.bin ({format_bytes(st.session_state.dl_size_b)})",
+            if st.session_state.dl_zip_url_b is not None:
+                deliver_zip(
+                    st.session_state.dl_zip_url_b,
+                    st.session_state.dl_zip_path_b,
+                    st.session_state.dl_zip_size_b,
+                    "merged_preferB.zip",
+                    f"⬇ merged_preferB.zip ({format_bytes(st.session_state.dl_zip_size_b)})",
                 )
             else:
                 # No conflicts → preferB is identical to preferA; serve same file
-                render_download_link(
-                    st.session_state.dl_url_a,
-                    "merged_preferB.bin",
-                    "⬇ merged_preferB.bin (identical to A — no conflicts)",
+                deliver_zip(
+                    st.session_state.dl_zip_url_a,
+                    st.session_state.dl_zip_path_a,
+                    st.session_state.dl_zip_size_a,
+                    "merged_preferB.zip",
+                    "⬇ merged_preferB.zip (identical to A — no conflicts)",
                 )
         st.caption(
             "Files are identical when there are no conflicts. On conflicts: "
