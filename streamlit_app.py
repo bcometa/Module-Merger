@@ -12,13 +12,16 @@ Batch mode: drop a bunch of files / a ZIP of folders / multiple ZIPs and the
 tool auto-pairs files using folder names (Copy 0 / Copy 1) or filename markers
 (02x0.bad / 02x1.bad). Outputs are bundled into ZIPs.
 """
-import base64
 import io
+import os
 import re
+import time
+import uuid
 import zipfile
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import streamlit as st
 
 # ============================================================================
@@ -34,6 +37,38 @@ st.set_page_config(
 PASSWORD = "11390"
 SECTOR_SIZE = 512
 DEAD_SECTOR = bytes([0xDE, 0xAD] * 256)
+DEAD_ROW = np.frombuffer(DEAD_SECTOR, dtype=np.uint8)  # (512,) for vectorized compare
+
+# --------------------------------------------------------------------------
+# Static file serving for downloads.
+#
+# Large merged outputs (100 MB+) are written to disk under ./static/merged/
+# and served by Streamlit's static file handler at the URL path
+# app/static/merged/<file>. This is what keeps the app under Streamlit
+# Cloud's 1 GB memory limit: the merged bytes never live in the app's Python
+# heap as a download payload (no base64 string, no download_button data=),
+# and Tornado streams the file straight from disk to the browser. Requires
+# `enableStaticServing = true` in .streamlit/config.toml.
+# --------------------------------------------------------------------------
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+DOWNLOAD_DIR = os.path.join(STATIC_DIR, "merged")
+DOWNLOAD_URL_PREFIX = "app/static/merged"  # relative URL Streamlit serves from
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+
+def _sweep_old_downloads(max_age_seconds: int = 7200) -> None:
+    """Delete generated download files older than max_age (default 2h)."""
+    now = time.time()
+    try:
+        for fn in os.listdir(DOWNLOAD_DIR):
+            fp = os.path.join(DOWNLOAD_DIR, fn)
+            try:
+                if now - os.path.getmtime(fp) > max_age_seconds:
+                    os.remove(fp)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 STATUS_MATCH = 0
 STATUS_RECOVER_A = 1
@@ -124,27 +159,28 @@ def is_zip_filename(name: str) -> bool:
     return name.lower().endswith(".zip")
 
 
-def render_download_link(b64_data: str, filename: str, mime: str, label: str) -> None:
+def render_download_link(url_path: str, filename: str, label: str) -> None:
     """
-    Render a styled download link using a base64 data: URI.
+    Render a styled download link that points at a static file on disk.
 
-    We bypass st.download_button because Streamlit's media-file manager
-    silently invalidates the file URL after the first click / rerun on
-    Streamlit Cloud, leaving the button with a dead href. A data: URI
-    embeds the bytes in the page itself — there is no server endpoint to
-    invalidate, so click → browser-native download → reliable every time.
+    url_path is a small same-origin URL (app/static/merged/<file>) that
+    Streamlit's static handler streams straight from disk. The HTML is a
+    few hundred bytes — no base64, no giant WebSocket payload, no browser
+    freeze — and clicking it downloads reliably every time because there is
+    no server-side media-file registration to go stale (the failure mode of
+    st.download_button on Streamlit Cloud). The `download` attribute sets the
+    save-as name so the user gets a clean filename regardless of the on-disk
+    (uuid-prefixed) name.
     """
     html = (
-        f'<a href="data:{mime};base64,{b64_data}" download="{filename}" '
+        f'<a href="{url_path}" download="{filename}" '
         f'style="display:flex;align-items:center;justify-content:center;'
-        f'width:100%;padding:0.5rem 1rem;background:#FF4B4B;color:white;'
-        f'text-decoration:none;border-radius:0.5rem;font-weight:500;'
-        f'font-size:0.875rem;border:1px solid transparent;'
-        f'box-sizing:border-box;font-family:inherit;cursor:pointer;'
-        f'transition:filter 0.15s;" '
+        f'width:100%;height:38px;padding:0 1rem;background:#FF4B4B;'
+        f'color:white;text-decoration:none;border-radius:0.5rem;'
+        f'font-weight:500;font-size:0.875rem;box-sizing:border-box;'
+        f'font-family:inherit;cursor:pointer;transition:filter 0.15s;margin-bottom:0.5rem;" '
         f'onmouseover="this.style.filter=\'brightness(1.1)\'" '
-        f'onmouseout="this.style.filter=\'brightness(1)\'">'
-        f'{label}</a>'
+        f'onmouseout="this.style.filter=\'brightness(1)\'">{label}</a>'
     )
     st.markdown(html, unsafe_allow_html=True)
 
@@ -386,91 +422,111 @@ def find_pairs(entries: List[Tuple[str, bytes]]) -> Tuple[List[Dict], List[Tuple
 # ============================================================================
 
 def process_one_pair(data_a: bytes, data_b: bytes) -> Tuple[bytes, Dict]:
-    """Returns (status_bytes, stats_dict). Caller validated sizes."""
-    total_sectors = len(data_a) // SECTOR_SIZE
-    status = bytearray(total_sectors)
+    """
+    Vectorized sector comparison with numpy. Returns (status_bytes, stats).
+
+    numpy makes this both fast and memory-light: the input bytes are wrapped
+    as zero-copy read-only views, and each boolean comparison temporary is
+    computed and freed one at a time rather than allocating two small bytes
+    objects per sector in a Python loop (which was the old approach's churn).
+    """
+    n = len(data_a) // SECTOR_SIZE
+    a = np.frombuffer(data_a, dtype=np.uint8).reshape(n, SECTOR_SIZE)
+    b = np.frombuffer(data_b, dtype=np.uint8).reshape(n, SECTOR_SIZE)
+
+    dead_a = (a == DEAD_ROW).all(axis=1)
+    dead_b = (b == DEAD_ROW).all(axis=1)
+    equal = (a == b).all(axis=1)
+
+    both_dead = dead_a & dead_b
+    only_a_dead = dead_a & ~dead_b       # A dead, B good  → recover from B
+    only_b_dead = dead_b & ~dead_a       # B dead, A good  → recover from A
+    neither = ~dead_a & ~dead_b
+    match = neither & equal
+    conflict = neither & ~equal
+
+    status = np.empty(n, dtype=np.uint8)
+    status[both_dead] = STATUS_ZEROED
+    status[only_a_dead] = STATUS_RECOVER_B
+    status[only_b_dead] = STATUS_RECOVER_A
+    status[match] = STATUS_MATCH
+    status[conflict] = STATUS_CONFLICT
+
     stats = {
-        "totalSectors": total_sectors,
+        "totalSectors": n,
         "totalBytes": len(data_a),
-        "deadInA": 0,
-        "deadInB": 0,
-        "deadInBoth": 0,
-        "matching": 0,
-        "recoveredFromA": 0,
-        "recoveredFromB": 0,
-        "conflicts": 0,
+        "deadInA": int(dead_a.sum()),
+        "deadInB": int(dead_b.sum()),
+        "deadInBoth": int(both_dead.sum()),
+        "matching": int(match.sum()),
+        "recoveredFromA": int(only_b_dead.sum()),  # A good, B dead
+        "recoveredFromB": int(only_a_dead.sum()),  # B good, A dead
+        "conflicts": int(conflict.sum()),
     }
-    mv_a = memoryview(data_a)
-    mv_b = memoryview(data_b)
-    for i in range(total_sectors):
-        offset = i * SECTOR_SIZE
-        sec_a = bytes(mv_a[offset:offset + SECTOR_SIZE])
-        sec_b = bytes(mv_b[offset:offset + SECTOR_SIZE])
-        a_dead = sec_a == DEAD_SECTOR
-        b_dead = sec_b == DEAD_SECTOR
-        if a_dead:
-            stats["deadInA"] += 1
-        if b_dead:
-            stats["deadInB"] += 1
-        if a_dead and b_dead:
-            stats["deadInBoth"] += 1
-            status[i] = STATUS_ZEROED
-        elif a_dead:
-            stats["recoveredFromB"] += 1
-            status[i] = STATUS_RECOVER_B
-        elif b_dead:
-            stats["recoveredFromA"] += 1
-            status[i] = STATUS_RECOVER_A
-        elif sec_a == sec_b:
-            stats["matching"] += 1
-            status[i] = STATUS_MATCH
-        else:
-            stats["conflicts"] += 1
-            status[i] = STATUS_CONFLICT
-    return bytes(status), stats
+    return status.tobytes(), stats
 
 
-def build_output(data_a: bytes, data_b: bytes, status: bytes, prefer_b: bool) -> bytes:
-    out = bytearray(len(data_a))
-    mv_a = memoryview(data_a)
-    mv_b = memoryview(data_b)
-    for i, s in enumerate(status):
-        offset = i * SECTOR_SIZE
-        if s == STATUS_ZEROED:
-            continue
-        if s == STATUS_MATCH or s == STATUS_RECOVER_A:
-            out[offset:offset + SECTOR_SIZE] = mv_a[offset:offset + SECTOR_SIZE]
-        elif s == STATUS_RECOVER_B:
-            out[offset:offset + SECTOR_SIZE] = mv_b[offset:offset + SECTOR_SIZE]
-        elif s == STATUS_CONFLICT:
-            src = mv_b if prefer_b else mv_a
-            out[offset:offset + SECTOR_SIZE] = src[offset:offset + SECTOR_SIZE]
-    return bytes(out)
+def _build_output_array(data_a: bytes, data_b: bytes, status_bytes: bytes,
+                        prefer_b: bool) -> np.ndarray:
+    """
+    Build the merged output as a writable numpy array (one 100 MB copy).
+
+    Start from a copy of A — that already covers MATCH and RECOVER_A. Then
+    overlay: RECOVER_B sectors from B, ZEROED sectors set to 0, and (only when
+    prefer_b) CONFLICT sectors from B. Conflict-prefer-A needs no work since
+    the base copy is already A.
+    """
+    n = len(status_bytes)
+    a = np.frombuffer(data_a, dtype=np.uint8).reshape(n, SECTOR_SIZE)
+    b = np.frombuffer(data_b, dtype=np.uint8).reshape(n, SECTOR_SIZE)
+    status = np.frombuffer(status_bytes, dtype=np.uint8)
+
+    out = a.copy()  # writable, ~file size
+    m_rb = status == STATUS_RECOVER_B
+    if m_rb.any():
+        out[m_rb] = b[m_rb]
+    out[status == STATUS_ZEROED] = 0
+    if prefer_b:
+        m_c = status == STATUS_CONFLICT
+        if m_c.any():
+            out[m_c] = b[m_c]
+    return out
 
 
-def build_zip(pairs: List[Dict], prefer_b: bool) -> bytes:
-    """Bundle all merged outputs into a flat ZIP. Returns the ZIP bytes."""
-    buf = io.BytesIO()
+def write_merged_binary(data_a: bytes, data_b: bytes, status_bytes: bytes,
+                        prefer_b: bool, out_path: str) -> int:
+    """Write a single merged binary straight to disk. Returns byte size."""
+    out = _build_output_array(data_a, data_b, status_bytes, prefer_b)
+    out.tofile(out_path)          # streams to disk, no extra in-memory copy
+    size = out.size
+    del out
+    return size
+
+
+def write_merged_zip(pairs: List[Dict], prefer_b: bool, out_path: str) -> int:
+    """
+    Write a flat ZIP of all merged outputs to disk. Returns ZIP byte size.
+
+    Each pair's output is materialized one at a time (peak = one output in
+    memory), added to the on-disk ZIP, then freed.
+    """
     used_names = set()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
+    with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
         for p in pairs:
             if p["status"] is None:
                 continue
-            out = build_output(p["data_a"], p["data_b"], p["status"], prefer_b=prefer_b)
+            out = _build_output_array(p["data_a"], p["data_b"], p["status"], prefer_b)
             name = p["out_name"]
-            # Disambiguate collisions
             final_name = name
-            n = 1
+            k = 1
             while final_name in used_names:
                 stem, dot, ext = name.rpartition(".")
-                if dot:
-                    final_name = f"{stem}_{n}.{ext}"
-                else:
-                    final_name = f"{name}_{n}"
-                n += 1
+                final_name = f"{stem}_{k}.{ext}" if dot else f"{name}_{k}"
+                k += 1
             used_names.add(final_name)
-            z.writestr(final_name, out)
-    return buf.getvalue()
+            z.writestr(final_name, out.tobytes())
+            del out
+    return os.path.getsize(out_path)
 
 
 # ============================================================================
@@ -679,35 +735,43 @@ for k, v in [
     ("last_a_sig", None),
     ("last_b_sig", None),
     ("processed", False),
-    # Cached merged outputs — base64-encoded strings, built ONCE at end of
-    # processing. The download links embed these directly as data: URIs, so the
-    # download mechanism never touches Streamlit's media-file manager (which is
-    # what was silently invalidating download URLs after the first click).
-    # We keep separate size fields so the button labels can show file size
-    # without decoding the base64 string.
-    ("cached_b64_a", None),
-    ("cached_b64_b", None),         # None == identical to A (no conflicts)
-    ("cached_zip_b64_a", None),
-    ("cached_zip_b64_b", None),     # None == identical to A
-    ("cached_size_a", 0),
-    ("cached_size_b", 0),
-    ("cached_zip_size_a", 0),
-    ("cached_zip_size_b", 0),
+    # Merged outputs are written to disk (static/merged/) and served by URL.
+    # Session state holds only the small URL paths + sizes, never the bytes —
+    # this is what keeps memory flat regardless of file size. A URL of None
+    # for the "B" variants means "identical to A" (no conflicts).
+    ("dl_url_a", None),
+    ("dl_url_b", None),
+    ("dl_size_a", 0),
+    ("dl_size_b", 0),
+    ("dl_zip_url_a", None),
+    ("dl_zip_url_b", None),
+    ("dl_zip_size_a", 0),
+    ("dl_zip_size_b", 0),
+    ("generated_files", []),        # absolute paths to unlink on next process/reset
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
 
 
 def _clear_cached_outputs() -> None:
-    """Wipe cached merged outputs. Call whenever the underlying data changes."""
-    st.session_state.cached_b64_a = None
-    st.session_state.cached_b64_b = None
-    st.session_state.cached_zip_b64_a = None
-    st.session_state.cached_zip_b64_b = None
-    st.session_state.cached_size_a = 0
-    st.session_state.cached_size_b = 0
-    st.session_state.cached_zip_size_a = 0
-    st.session_state.cached_zip_size_b = 0
+    """
+    Wipe download references AND delete the on-disk files they pointed at.
+    Called whenever the underlying data changes (new upload, swap, reset).
+    """
+    for fp in st.session_state.get("generated_files", []) or []:
+        try:
+            os.remove(fp)
+        except OSError:
+            pass
+    st.session_state.generated_files = []
+    st.session_state.dl_url_a = None
+    st.session_state.dl_url_b = None
+    st.session_state.dl_size_a = 0
+    st.session_state.dl_size_b = 0
+    st.session_state.dl_zip_url_a = None
+    st.session_state.dl_zip_url_b = None
+    st.session_state.dl_zip_size_a = 0
+    st.session_state.dl_zip_size_b = 0
 
 
 # ============================================================================
@@ -919,49 +983,59 @@ if process_clicked and st.session_state.pairs:
         progress.progress((i + 1) / n, text=f"Processing pair {i + 1} of {n}: {p['out_name']}")
     progress.empty()
 
-    # Build the merged outputs ONCE, base64-encode them, and cache the encoded
-    # strings. The download links embed these as data: URIs (see
-    # render_download_link), so subsequent reruns just look up the cached
-    # string. Raw bytes are freed immediately after encoding to keep memory in
-    # check on Streamlit Cloud (each output gets ~133% larger as base64, but
-    # we only hold one copy in memory at a time).
+    # Build the merged outputs ONCE and write them straight to disk under
+    # static/merged/. Session state keeps only the tiny URL + size. Downloads
+    # are then served by Streamlit's static file handler (Tornado streams from
+    # disk), so the merged bytes never sit in the app's heap as a payload —
+    # this is what keeps us under the 1 GB Streamlit Cloud memory limit and
+    # makes large-file downloads reliable.
+    _clear_cached_outputs()   # delete any files from a previous run
+    _sweep_old_downloads()    # and any stragglers older than 2h
+    token = uuid.uuid4().hex[:8]
+
     successful_pairs = [p for p in st.session_state.pairs if p["status"] is not None]
     if successful_pairs:
         if len(st.session_state.pairs) == 1 and len(successful_pairs) == 1:
-            # Single-pair mode → cache the two binaries
+            # Single-pair mode → write the two binaries to disk
             sp = successful_pairs[0]
             build_msg = st.empty()
-            build_msg.info("Building merged binaries…")
-            raw_a = build_output(sp["data_a"], sp["data_b"], sp["status"], prefer_b=False)
-            st.session_state.cached_size_a = len(raw_a)
-            st.session_state.cached_b64_a = base64.b64encode(raw_a).decode("ascii")
-            del raw_a
+            build_msg.info("Building merged binary…")
+            fn_a = f"{token}_merged_preferA.bin"
+            path_a = os.path.join(DOWNLOAD_DIR, fn_a)
+            st.session_state.dl_size_a = write_merged_binary(
+                sp["data_a"], sp["data_b"], sp["status"], False, path_a)
+            st.session_state.dl_url_a = f"{DOWNLOAD_URL_PREFIX}/{fn_a}"
+            st.session_state.generated_files.append(path_a)
             if sp["stats"]["conflicts"] > 0:
-                raw_b = build_output(sp["data_a"], sp["data_b"], sp["status"], prefer_b=True)
-                st.session_state.cached_size_b = len(raw_b)
-                st.session_state.cached_b64_b = base64.b64encode(raw_b).decode("ascii")
-                del raw_b
+                fn_b = f"{token}_merged_preferB.bin"
+                path_b = os.path.join(DOWNLOAD_DIR, fn_b)
+                st.session_state.dl_size_b = write_merged_binary(
+                    sp["data_a"], sp["data_b"], sp["status"], True, path_b)
+                st.session_state.dl_url_b = f"{DOWNLOAD_URL_PREFIX}/{fn_b}"
+                st.session_state.generated_files.append(path_b)
             else:
-                st.session_state.cached_b64_b = None  # signals "identical to A"
-                st.session_state.cached_size_b = 0
+                st.session_state.dl_url_b = None  # identical to A
+                st.session_state.dl_size_b = 0
             build_msg.empty()
         else:
-            # Batch mode → cache the ZIP(s)
+            # Batch mode → write the ZIP(s) to disk
             build_msg = st.empty()
             build_msg.info(f"Building merged ZIP for {len(successful_pairs)} pair(s)…")
-            raw_zip_a = build_zip(successful_pairs, prefer_b=False)
-            st.session_state.cached_zip_size_a = len(raw_zip_a)
-            st.session_state.cached_zip_b64_a = base64.b64encode(raw_zip_a).decode("ascii")
-            del raw_zip_a
+            fn_za = f"{token}_merged_preferA.zip"
+            path_za = os.path.join(DOWNLOAD_DIR, fn_za)
+            st.session_state.dl_zip_size_a = write_merged_zip(successful_pairs, False, path_za)
+            st.session_state.dl_zip_url_a = f"{DOWNLOAD_URL_PREFIX}/{fn_za}"
+            st.session_state.generated_files.append(path_za)
             has_conflicts = any(p["stats"]["conflicts"] > 0 for p in successful_pairs)
             if has_conflicts:
-                raw_zip_b = build_zip(successful_pairs, prefer_b=True)
-                st.session_state.cached_zip_size_b = len(raw_zip_b)
-                st.session_state.cached_zip_b64_b = base64.b64encode(raw_zip_b).decode("ascii")
-                del raw_zip_b
+                fn_zb = f"{token}_merged_preferB.zip"
+                path_zb = os.path.join(DOWNLOAD_DIR, fn_zb)
+                st.session_state.dl_zip_size_b = write_merged_zip(successful_pairs, True, path_zb)
+                st.session_state.dl_zip_url_b = f"{DOWNLOAD_URL_PREFIX}/{fn_zb}"
+                st.session_state.generated_files.append(path_zb)
             else:
-                st.session_state.cached_zip_b64_b = None  # signals "identical to A"
-                st.session_state.cached_zip_size_b = 0
+                st.session_state.dl_zip_url_b = None  # identical to A
+                st.session_state.dl_zip_size_b = 0
             build_msg.empty()
 
     st.session_state.processed = True
@@ -1028,29 +1102,26 @@ if st.session_state.processed and st.session_state.pairs:
 
         # ----- ZIP Downloads -----
         st.markdown("##### Downloads")
-        if successful and st.session_state.cached_zip_b64_a is not None:
+        if successful and st.session_state.dl_zip_url_a is not None:
             dl_cols = st.columns(2)
             with dl_cols[0]:
                 render_download_link(
-                    st.session_state.cached_zip_b64_a,
+                    st.session_state.dl_zip_url_a,
                     "merged_preferA.zip",
-                    "application/zip",
-                    f"⬇ merged_preferA.zip ({format_bytes(st.session_state.cached_zip_size_a)})",
+                    f"⬇ merged_preferA.zip ({format_bytes(st.session_state.dl_zip_size_a)})",
                 )
             with dl_cols[1]:
-                if st.session_state.cached_zip_b64_b is not None:
+                if st.session_state.dl_zip_url_b is not None:
                     render_download_link(
-                        st.session_state.cached_zip_b64_b,
+                        st.session_state.dl_zip_url_b,
                         "merged_preferB.zip",
-                        "application/zip",
-                        f"⬇ merged_preferB.zip ({format_bytes(st.session_state.cached_zip_size_b)})",
+                        f"⬇ merged_preferB.zip ({format_bytes(st.session_state.dl_zip_size_b)})",
                     )
                 else:
-                    # No conflicts → would be identical to A
+                    # No conflicts → identical to A; serve the same file
                     render_download_link(
-                        st.session_state.cached_zip_b64_a,
+                        st.session_state.dl_zip_url_a,
                         "merged_preferB.zip",
-                        "application/zip",
                         "⬇ merged_preferB.zip (identical to A — no conflicts)",
                     )
             st.caption(
@@ -1101,25 +1172,22 @@ if st.session_state.processed and st.session_state.pairs:
         dl_cols = st.columns(2)
         with dl_cols[0]:
             render_download_link(
-                st.session_state.cached_b64_a,
+                st.session_state.dl_url_a,
                 "merged_preferA.bin",
-                "application/octet-stream",
-                f"⬇ merged_preferA.bin ({format_bytes(st.session_state.cached_size_a)})",
+                f"⬇ merged_preferA.bin ({format_bytes(st.session_state.dl_size_a)})",
             )
         with dl_cols[1]:
-            if st.session_state.cached_b64_b is not None:
+            if st.session_state.dl_url_b is not None:
                 render_download_link(
-                    st.session_state.cached_b64_b,
+                    st.session_state.dl_url_b,
                     "merged_preferB.bin",
-                    "application/octet-stream",
-                    f"⬇ merged_preferB.bin ({format_bytes(st.session_state.cached_size_b)})",
+                    f"⬇ merged_preferB.bin ({format_bytes(st.session_state.dl_size_b)})",
                 )
             else:
-                # No conflicts → preferB is identical to preferA; reuse cached_b64_a
+                # No conflicts → preferB is identical to preferA; serve same file
                 render_download_link(
-                    st.session_state.cached_b64_a,
+                    st.session_state.dl_url_a,
                     "merged_preferB.bin",
-                    "application/octet-stream",
                     "⬇ merged_preferB.bin (identical to A — no conflicts)",
                 )
         st.caption(
