@@ -1,0 +1,3 @@
+# This folder is served by Streamlit's static file handler (enableStaticServing).
+# Merged output files are written to static/merged/ at runtime and served at
+# app/static/merged/<file>. Keep this folder in the repo so it exists at deploy.
