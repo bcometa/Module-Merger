@@ -1,5 +1,8 @@
 [server]
-# Bump the WebSocket message cap so large download data URIs aren't truncated
-# when shipped to the browser as HTML. Default is 200 MB.
-maxMessageSize = 500
+# Serve merged output files from the ./static/ folder at URL app/static/...
+# This lets large downloads stream from disk instead of living in the app's
+# memory as a payload — the key to staying under Streamlit Cloud's 1 GB limit.
+enableStaticServing = true
+
+# Allow uploads up to 500 MB (two ~100 MB module copies + headroom).
 maxUploadSize = 500
